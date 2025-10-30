@@ -492,12 +492,22 @@ class FlashAttentionForwardSm100:
             self.empty_warp_ids = ()
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
+            if const_expr(self.is_split_kv and mCuSeqlensQ is None):
+                mO = mO[None, None, None, None, 0]
+            print("[mO]", mO)
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
                 tma_store_op,
                 mO,
                 cute.select(sO_layout, mode=[0, 1]),
                 o_cta_v_layout,
             )
+            print("[tma_atom_O]", tma_atom_O)
+            if const_expr(self.is_split_kv and mCuSeqlensQ is None):
+                mO = cute.make_tensor(mO.iterator, cute.make_layout(
+                    mO.shape + (num_splits,),
+                    stride=mO.stride + (mO.shape[3] * mO.stride[3],),
+                ))
+            print("[tma_tensor_O]", mO)
             gmem_tiled_copy_O = None
         else:
             tma_atom_O = None
