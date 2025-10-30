@@ -492,12 +492,7 @@ class FlashAttentionForwardSm100:
             self.empty_warp_ids = ()
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
-            tma_atom_O, mO = cpasync.make_tiled_tma_atom(
-                tma_store_op,
-                mO,
-                cute.select(sO_layout, mode=[0, 1]),
-                o_cta_v_layout,
-            )
+            tma_atom_O = None
             gmem_tiled_copy_O = None
         else:
             tma_atom_O = None
@@ -2117,10 +2112,10 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def epilogue_s2g(
         self,
-        mO: cute.Tensor,
+        _mO: cute.Tensor,
         sO: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
-        tma_atom_O: Optional[cute.CopyAtom],
+        _tma_atom_O: Optional[cute.CopyAtom],
         mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         num_splits: int,
@@ -2137,9 +2132,24 @@ class FlashAttentionForwardSm100:
 
             if n_block_min < n_block_max:
                 if const_expr(self.is_split_kv):
-                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
+                    mO = _mO[None, None, head_idx, None, split_idx]
                 else:
-                    mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+                    mO = _mO[None, None, head_idx, None]
+
+                if const_expr(self.use_tma_O):
+                    print("[mO]", mO)
+                    print("[sO.layout]", cute.select(sO.layout, mode=[0, 1]))
+                    print("[cta_tile_layout]", cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile))
+                    tma_atom_O, mO = cpasync.make_tiled_tma_atom(
+                        cpasync.CopyBulkTensorTileS2GOp(),
+                        mO,
+                        cute.select(sO.layout, mode=[0, 1]),
+                        cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile),
+                    )
+                else:
+                    tma_atom_O = None
+
+                mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=2)
                 gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
                 if const_expr(self.use_tma_O):
                     store_O, _, _ = copy_utils.tma_get_copy_fn(
