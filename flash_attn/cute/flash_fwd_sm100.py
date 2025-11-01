@@ -125,7 +125,7 @@ class FlashAttentionForwardSm100:
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
         self.mma_warp_id = 12
-        self.load_warp_id = 13
+        self.load_warp_ids = (13,)
         self.epilogue_warp_ids = (14,)
         self.empty_warp_ids = (15,)
         SM100_TMEM_CAPACITY_COLUMNS = 512
@@ -137,7 +137,7 @@ class FlashAttentionForwardSm100:
                 *self.softmax1_warp_ids,
                 *self.correction_warp_ids,
                 self.mma_warp_id,
-                self.load_warp_id,
+                *self.load_warp_ids,
                 *self.epilogue_warp_ids,
                 *self.empty_warp_ids,
             )
@@ -484,6 +484,9 @@ class FlashAttentionForwardSm100:
                 self.cluster_layout_vmnk.shape,
             )
         else:
+            assert self.use_tma_O, "Loading O and K/V will contend for the empty warp."
+            self.epilogue_warp_ids = (13,)
+            self.load_warp_ids = (14, 15)
             tma_atom_K = None
             tma_atom_V = None
 
@@ -740,7 +743,7 @@ class FlashAttentionForwardSm100:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
             for i in cutlass.range_constexpr(self.q_stage):
                 cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_load_q_full_offset + i, len([self.load_warp_id])
+                    mbar_ptr + self.mbar_load_q_full_offset + i, 1
                 )
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_load_q_empty_offset + i, len([self.mma_warp_id])
@@ -893,7 +896,7 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.load_warp_id:
+        if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             self.load(
                 thr_mma_qk,
@@ -1113,7 +1116,7 @@ class FlashAttentionForwardSm100:
                 )
                 paged_kv_manager = None
             else:
-                num_load_threads = len([self.load_warp_id]) * 32
+                num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
                 tidx = cute.arch.thread_idx()[0] % num_load_threads
                 page_size = mK.shape[0]
                 paged_kv_manager = PagedKVManager.create(
@@ -2276,7 +2279,7 @@ class FlashAttentionForwardSm100:
         )
         if self.use_tma_KV:
             load_kv_producer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
+                cutlass.pipeline.Agent.Thread, len(self.load_warp_ids)
             )
             return cutlass.pipeline.PipelineTmaUmma.create(
                 barrier_storage=load_kv_mbar_ptr,
@@ -2287,7 +2290,7 @@ class FlashAttentionForwardSm100:
             )
         else:
             load_kv_producer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, len([self.load_warp_id]) * cute.arch.WARP_SIZE
+                cutlass.pipeline.Agent.Thread, len(self.load_warp_ids) * cute.arch.WARP_SIZE
             )
             return cutlass.pipeline.PipelineAsyncUmma.create(
                 num_stages=self.kv_stage,
