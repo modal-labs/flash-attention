@@ -10,6 +10,12 @@ from flash_attn.cute import utils
 from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.cute_dsl_utils import ParamsBase
 
+import os
+
+OVERRIDE_NUM_PTR_CALCULATIONS = int(os.environ.get("OVERRIDE_NUM_PTR_CALCULATIONS", -1))
+OVERRIDE_GMEM_THREADS_PER_ROW = int(os.environ.get("OVERRIDE_GMEM_THREADS_PER_ROW", -1))
+ABLATE_PAGE_TABLE_LOAD = os.environ.get("ABLATE_PAGE_TABLE_LOAD", "0") == "1"
+
 
 @dataclass
 class PagedKVManager(ParamsBase):
@@ -56,6 +62,8 @@ class PagedKVManager(ParamsBase):
     ):
         universal_copy_bits = 128
         gmem_threads_per_row = 8  # 8 threads loading 128 bits = 128 bytes = 1 cache line
+        if const_expr(OVERRIDE_GMEM_THREADS_PER_ROW != -1):
+            gmem_threads_per_row = OVERRIDE_GMEM_THREADS_PER_ROW
         async_copy_elems = universal_copy_bits // dtype.width
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -71,8 +79,13 @@ class PagedKVManager(ParamsBase):
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         page_entry_per_thread = n_block_size * gmem_threads_per_row // num_threads
 
-        tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
-        tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
+        num_ptr_calculations = (
+            page_entry_per_thread
+            if const_expr(OVERRIDE_NUM_PTR_CALCULATIONS == -1)
+            else OVERRIDE_NUM_PTR_CALCULATIONS
+        )
+        tPrPage = cute.make_rmem_tensor((num_ptr_calculations,), Int32)
+        tPrPageOffset = cute.make_rmem_tensor((num_ptr_calculations,), Int32)
 
         mPageTable = mPageTable[bidb, None]
         mK_paged = mK_paged[None, None, bidh, None]
@@ -114,19 +127,25 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def load_page_table(self, n_block: Int32):
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
-            row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
-            row_idx = n_block * self.n_block_size + row
+        reps = cute.size(self.tPrPage) // self.page_entry_per_thread
+        for rep in cutlass.range(reps, unroll=1):
+            for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+                row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
+                row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
+                page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
 
-            is_valid = (
-                (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
-            ) and row_idx < self.seqlen_k
-            page = self.mPageTable[page_idx] if is_valid else 0
+                is_valid = (
+                    (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
+                ) and row_idx < self.seqlen_k
+                if const_expr(ABLATE_PAGE_TABLE_LOAD):
+                    page = page_idx if is_valid else 0
+                else:
+                    page = self.mPageTable[page_idx] if is_valid else 0
 
-            self.tPrPage[i] = page
-            self.tPrPageOffset[i] = page_offset
+                self.tPrPage[i] = page
+
+                self.tPrPageOffset[i] = page_offset
 
     @cute.jit
     def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
@@ -149,6 +168,9 @@ class PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+
+        print("[tXsX]", tXsX)
+        print("[tPrPage]", self.tPrPage)
 
         seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size
         for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):

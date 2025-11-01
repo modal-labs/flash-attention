@@ -21,8 +21,8 @@ def benchmark(num_kv_entries, page_size, batch_size, seqlen_q, seqlen_k, nhead, 
     k_cache = torch.randn(num_pages, page_size, nhead, head_dim, device="cuda", dtype=torch.bfloat16)
     v_cache = torch.randn(num_pages, page_size, nhead, head_dim, device="cuda", dtype=torch.bfloat16)
 
-    # page_table = torch.arange(0, batch_size * pages_per_seq, device="cuda", dtype=torch.int32).reshape(batch_size, pages_per_seq)
-    page_table = torch.randint(0, num_pages, (batch_size, pages_per_seq), device="cuda", dtype=torch.int32)
+    page_table = torch.arange(0, batch_size * pages_per_seq, device="cuda", dtype=torch.int32).reshape(batch_size, pages_per_seq)
+    # page_table = torch.randint(0, num_pages, (batch_size, pages_per_seq), device="cuda", dtype=torch.int32)
 
     def fn():
         return flash_attn_varlen_func(q, k_cache, v_cache, page_table=page_table)[0]
@@ -76,7 +76,7 @@ def main():
     args.add_argument("--page_size", type=int, nargs="+", default=[128])
     args.add_argument("--batch_size", type=int, nargs="+", default=[1])
     args.add_argument("--seqlen_q", type=int, nargs="+", default=[1])
-    args.add_argument("--seqlen_k", type=int, nargs="+", default=[4096])
+    args.add_argument("--seqlen_k", type=int, nargs="+", default=[131072])
     args.add_argument("--nhead", type=int, nargs="+", default=[32])
     args.add_argument("--head_dim", type=int, nargs="+", default=[128])
     args = args.parse_args()
