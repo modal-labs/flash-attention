@@ -85,7 +85,17 @@ def _dtype_from_str(s: str) -> torch.dtype:
         return torch.bfloat16
     if s in ("fp16", "float16", "half"):
         return torch.float16
-    raise ValueError(f"Unsupported dtype {s!r} (expected bf16 or fp16)")
+    if s in ("fp8_e4m3fn", "fp8e4m3fn", "fp8_e4m3", "fp8e4m3", "e4m3"):
+        return torch.float8_e4m3fn
+    if s in ("fp8_e5m2", "fp8e5m2", "e5m2"):
+        return torch.float8_e5m2
+    raise ValueError(
+        f"Unsupported dtype {s!r} (expected bf16, fp16, fp8_e4m3fn, or fp8_e5m2)"
+    )
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,13 +156,15 @@ def _bytes_per_step(
     nheads_kv: int,
     headdim: int,
     headdim_v: int,
-    dtype: torch.dtype,
+    dtype_qkv: torch.dtype,
+    dtype_out: torch.dtype,
 ) -> int:
-    bpe = torch.tensor([], dtype=dtype).element_size()
-    bytes_k = seqlen_k_total * nheads_kv * headdim * bpe
-    bytes_v = seqlen_k_total * nheads_kv * headdim_v * bpe
-    bytes_q = batch_size * seqlen_q * nheads_q * headdim * bpe
-    bytes_o = batch_size * seqlen_q * nheads_q * headdim_v * bpe
+    bpe_qkv = torch.tensor([], dtype=dtype_qkv).element_size()
+    bpe_out = torch.tensor([], dtype=dtype_out).element_size()
+    bytes_k = seqlen_k_total * nheads_kv * headdim * bpe_qkv
+    bytes_v = seqlen_k_total * nheads_kv * headdim_v * bpe_qkv
+    bytes_q = batch_size * seqlen_q * nheads_q * headdim * bpe_qkv
+    bytes_o = batch_size * seqlen_q * nheads_q * headdim_v * bpe_out
     return bytes_k + bytes_v + bytes_q + bytes_o
 
 
@@ -178,17 +190,24 @@ def _bench_one(
 
     assert cfg.nheads_q % cfg.nheads_kv == 0, "nheads_q must be divisible by nheads_kv"
     qhead_per_kvhead = cfg.nheads_q // cfg.nheads_kv
+    is_fp8 = _is_fp8_dtype(cfg.dtype)
 
     compute_capability = fa4._get_device_capability()
     pack_gqa_eff = cfg.pack_gqa
     if pack_gqa_eff is None:
         pack_gqa_eff = qhead_per_kvhead > 1
-    if compute_capability == 10:
-        if pack_gqa_eff and (128 % qhead_per_kvhead != 0):
-            pack_gqa_eff = False
+    if compute_capability in (10, 11):
         if pack_gqa_eff and cfg.num_splits != 1:
             # interface disables pack_gqa for SplitKV + non-varlen-q.
             pack_gqa_eff = False
+
+    # Mirror interface q_stage heuristic (SM100+): use 2-stage Q pipelining only when it helps.
+    # Note: interface uses max_seqlen_q * qhead_per_kvhead (independent of pack_gqa).
+    seqlen_q_packgqa = seqlen_q * qhead_per_kvhead
+    if compute_capability == 10:
+        q_stage = 2 if seqlen_q_packgqa > cfg.m_block_size else 1
+    else:
+        q_stage = 1
 
     # SM100 kernel currently assumes page_size == n_block_size for the TMA paged path.
     if cfg.page_size == 128 and cfg.n_block_size != 128:
@@ -199,21 +218,40 @@ def _bench_one(
     total_pages = cfg.batch_size * pages_per_seq
 
     torch.manual_seed(seed)
-    q = torch.randn(
-        (cfg.batch_size, seqlen_q, cfg.nheads_q, cfg.headdim),
-        device=device,
-        dtype=cfg.dtype,
-    )
-    k = torch.randn(
-        (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim),
-        device=device,
-        dtype=cfg.dtype,
-    )
-    v = torch.randn(
-        (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim_v),
-        device=device,
-        dtype=cfg.dtype,
-    )
+    if is_fp8:
+        q = torch.randn(
+            (cfg.batch_size, seqlen_q, cfg.nheads_q, cfg.headdim),
+            device=device,
+            dtype=torch.bfloat16,
+        ).to(cfg.dtype)
+        k = torch.randn(
+            (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim),
+            device=device,
+            dtype=torch.bfloat16,
+        ).to(cfg.dtype)
+        v = torch.randn(
+            (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim_v),
+            device=device,
+            dtype=torch.bfloat16,
+        ).to(cfg.dtype)
+        out_dtype = torch.bfloat16
+    else:
+        q = torch.randn(
+            (cfg.batch_size, seqlen_q, cfg.nheads_q, cfg.headdim),
+            device=device,
+            dtype=cfg.dtype,
+        )
+        k = torch.randn(
+            (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim),
+            device=device,
+            dtype=cfg.dtype,
+        )
+        v = torch.randn(
+            (total_pages, cfg.page_size, cfg.nheads_kv, cfg.headdim_v),
+            device=device,
+            dtype=cfg.dtype,
+        )
+        out_dtype = cfg.dtype
     page_table = _make_page_table(
         batch_size=cfg.batch_size,
         pages_per_seq=pages_per_seq,
@@ -222,7 +260,7 @@ def _bench_one(
         seed=seed,
     )
     cache_seqlens = torch.full((cfg.batch_size,), cfg.seqlen_k, device=device, dtype=torch.int32)
-    out = torch.empty((cfg.batch_size, seqlen_q, cfg.nheads_q, cfg.headdim_v), device=device, dtype=cfg.dtype)
+    out = torch.empty((cfg.batch_size, seqlen_q, cfg.nheads_q, cfg.headdim_v), device=device, dtype=out_dtype)
 
     # Compile & warm up using the public wrapper once.
     # For split-KV we benchmark via compiled kernels to avoid per-iter allocations in _flash_attn_fwd.
@@ -269,8 +307,12 @@ def _bench_one(
             False,  # window_size_left is not None
             False,  # window_size_right is not None
             False,  # learnable_sink is not None
+            False,  # q_descale is not None
+            False,  # k_descale is not None
+            False,  # v_descale is not None
             cfg.m_block_size,
             cfg.n_block_size,
+            q_stage,
             384,  # num_threads (ignored on sm100 but in compile key)
             is_split_kv,
             pack_gqa_eff,
@@ -278,8 +320,6 @@ def _bench_one(
             cfg.page_size not in (128,),  # paged KV non-TMA flag
         )
         compiled_fwd = fa4._flash_attn_fwd.compile_cache[compile_key]
-
-        current_stream = fa4.cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
         if is_split_kv:
             out_partial = torch.empty(
@@ -295,10 +335,16 @@ def _bench_one(
             )
 
             def fn():
+                current_stream = fa4.cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+                q_call, k_call, v_call = q, k, v
+                if is_fp8:
+                    q_call = q.view(torch.uint8)
+                    k_call = k.view(torch.uint8)
+                    v_call = v.view(torch.uint8)
                 compiled_fwd(
-                    q,
-                    k,
-                    v,
+                    q_call,
+                    k_call,
+                    v_call,
                     out_partial,
                     lse_partial,
                     softmax_scale,
@@ -311,6 +357,9 @@ def _bench_one(
                     None,  # window_size_left
                     None,  # window_size_right
                     None,  # learnable_sink
+                    None,  # q_descale
+                    None,  # k_descale
+                    None,  # v_descale
                     None,  # block_sparse_tensors
                     None,  # aux_tensors
                 )
@@ -326,10 +375,16 @@ def _bench_one(
         else:
 
             def fn():
+                current_stream = fa4.cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+                q_call, k_call, v_call = q, k, v
+                if is_fp8:
+                    q_call = q.view(torch.uint8)
+                    k_call = k.view(torch.uint8)
+                    v_call = v.view(torch.uint8)
                 compiled_fwd(
-                    q,
-                    k,
-                    v,
+                    q_call,
+                    k_call,
+                    v_call,
                     out,
                     None,  # lse
                     softmax_scale,
@@ -342,6 +397,9 @@ def _bench_one(
                     None,  # window_size_left
                     None,  # window_size_right
                     None,  # learnable_sink
+                    None,  # q_descale
+                    None,  # k_descale
+                    None,  # v_descale
                     None,  # block_sparse_tensors
                     None,  # aux_tensors
                 )
@@ -382,7 +440,8 @@ def _bench_one(
         nheads_kv=cfg.nheads_kv,
         headdim=cfg.headdim,
         headdim_v=cfg.headdim_v,
-        dtype=cfg.dtype,
+        dtype_qkv=cfg.dtype,
+        dtype_out=out_dtype,
     )
 
     t_s = t_ms * 1e-3
@@ -390,12 +449,14 @@ def _bench_one(
     tok_s = tokens / t_s
     gb_s = (mem_bytes / 1e9) / t_s
     return {
+        "dtype": str(cfg.dtype).replace("torch.", ""),
         "batch": cfg.batch_size,
         "seqlen_k": cfg.seqlen_k,
         "page_size": cfg.page_size,
         "page_table_layout": cfg.page_table_layout,
         "m_block": cfg.m_block_size,
         "n_block": cfg.n_block_size,
+        "q_stage": q_stage,
         "num_splits": cfg.num_splits,
         "pack_gqa_req": cfg.pack_gqa,
         "pack_gqa_eff": pack_gqa_eff,
@@ -410,7 +471,7 @@ def _bench_one(
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtype", type=str, default="bf16", help="bf16 or fp16")
+    parser.add_argument("--dtype", type=str, default="bf16", help="bf16, fp16, fp8_e4m3fn, or fp8_e5m2")
     parser.add_argument("--nheads-q", type=int, default=128)
     parser.add_argument("--nheads-kv", type=int, default=16)
     parser.add_argument("--headdim", type=int, default=128)
@@ -537,9 +598,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         rows.append(row)
 
         print(
-            "B={batch:<4d} K={seqlen_k:<6d} page={page_size:<3d} "
+            "dtype={dtype:<14s} B={batch:<4d} K={seqlen_k:<6d} page={page_size:<3d} "
             "m={m_block:<3d} n={n_block:<3d} splits={num_splits:<3d} "
-            "pack_gqa={pack_gqa_eff!s:<5} causal={causal!s:<5} "
+            "qstage={q_stage:<1d} pack_gqa={pack_gqa_eff!s:<5} causal={causal!s:<5} "
             "t={time_us:8.1f} us  tok/s={tok_s:10.1f}  est={gb_s_est:7.1f} GB/s".format(**row)
         )
 
