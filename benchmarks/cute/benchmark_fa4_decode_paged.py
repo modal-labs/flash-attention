@@ -7,8 +7,9 @@ Goal: approximate vLLM / sglang-style decode attention:
   - paged KV cache (K/V stored in pages; page_table maps seq -> physical pages)
   - per-sequence cache lengths (seqused_k / cache_seqlens)
   - Example “find best settings” sweep (writes CSV):
-    ./venv/bin/python benchmarks/cute/benchmark_fa4_decode_paged.py --batch-sizes 1,8,32,128 --seqlen-ks 1k,2k,4k,8k,16k,32k --page-sizes 16,32,64,128
-    --m-block-sizes 64,128 --n-block-sizes 64,128 --num-splits 1,2,4,8 --bench-mode compiled+cudagraph --csv /tmp/fa4_decode.csv
+    ./venv/bin/python benchmarks/cute/benchmark_fa4_decode_paged.py --batch-sizes 1,8,32,128 --seqlen-ks 1k,2k,4k,8k,16k,32k --page-sizes 128,256,512
+    --m-block-sizes 128 --n-block-sizes 128 --num-splits 1,2,4,8,16 --bench-mode compiled+cudagraph --csv /tmp/fa4_decode.csv
+  - Note: on SM100, the current TMA paged-KV fast path uses `n_block_size=128` and supports `page_size` multiples of 128.
   - If you want to test “decode as noncausal” (often valid for q_len=1 and can enable different scheduling):
     ./venv/bin/python benchmarks/cute/benchmark_fa4_decode_paged.py --no-causal ...
 This script is intentionally SM100-only (B200).
@@ -22,6 +23,7 @@ import itertools
 import math
 import os
 import re
+import sys
 from typing import Iterable, Literal, Optional
 
 import torch
@@ -196,10 +198,6 @@ def _bench_one(
     pack_gqa_eff = cfg.pack_gqa
     if pack_gqa_eff is None:
         pack_gqa_eff = qhead_per_kvhead > 1
-    if compute_capability in (10, 11):
-        if pack_gqa_eff and cfg.num_splits != 1:
-            # interface disables pack_gqa for SplitKV + non-varlen-q.
-            pack_gqa_eff = False
 
     # Mirror interface q_stage heuristic (SM100+): use 2-stage Q pipelining only when it helps.
     # Note: interface uses max_seqlen_q * qhead_per_kvhead (independent of pack_gqa).
@@ -209,9 +207,11 @@ def _bench_one(
     else:
         q_stage = 1
 
-    # SM100 kernel currently assumes page_size == n_block_size for the TMA paged path.
-    if cfg.page_size == 128 and cfg.n_block_size != 128:
-        raise ValueError("For page_size=128 (TMA paged path), require n_block_size=128.")
+    # SM100 TMA paged path supports page_size multiples of 128 with n_block_size=128.
+    if cfg.page_size >= 128 and cfg.page_size % 128 == 0 and cfg.n_block_size != 128:
+        raise ValueError(
+            f"For page_size={cfg.page_size} (TMA paged path), require n_block_size=128."
+        )
 
     # Allocate tensors.
     pages_per_seq = (cfg.seqlen_k + cfg.page_size - 1) // cfg.page_size
@@ -304,6 +304,7 @@ def _bench_one(
             True,  # seqused_q is None
             False,  # seqused_k is None
             True,  # page_table is not None
+            cfg.page_size,
             False,  # window_size_left is not None
             False,  # window_size_right is not None
             False,  # learnable_sink is not None
@@ -317,7 +318,7 @@ def _bench_one(
             is_split_kv,
             pack_gqa_eff,
             compute_capability,
-            cfg.page_size not in (128,),  # paged KV non-TMA flag
+            not (cfg.page_size >= 128 and cfg.page_size % 128 == 0 and cfg.n_block_size == 128),  # paged KV non-TMA flag
         )
         compiled_fwd = fa4._flash_attn_fwd.compile_cache[compile_key]
 
@@ -480,16 +481,18 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     parser.add_argument("--batch-sizes", type=str, default="1,8,32,128")
     parser.add_argument("--seqlen-ks", type=str, default="1k,2k,4k,8k,16k,32k")
-    parser.add_argument("--page-sizes", type=str, default="16,32,64,128")
+    # Default to page_size=128 since that's the current SM100 TMA paged fast path.
+    parser.add_argument("--page-sizes", type=str, default="128")
     parser.add_argument(
         "--page-table-layout",
         type=str,
         default="semi_contig_shuffle",
         choices=["semi_contig_shuffle", "contig", "random"],
     )
-    parser.add_argument("--m-block-sizes", type=str, default="64,128")
-    parser.add_argument("--n-block-sizes", type=str, default="64,128")
-    parser.add_argument("--num-splits", type=str, default="1,2,4,8")
+    # SM100 decode defaults (safe/fast path).
+    parser.add_argument("--m-block-sizes", type=str, default="128")
+    parser.add_argument("--n-block-sizes", type=str, default="128")
+    parser.add_argument("--num-splits", type=str, default="1,2,4,8,16")
     parser.add_argument(
         "--pack-gqa",
         type=str,
@@ -560,8 +563,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     for batch_size, seqlen_k, page_size, m_block, n_block, num_splits in sweep_iter:
         # Skip unsupported combos:
-        # - TMA paged path assumes page_size == n_block_size == 128.
-        if page_size == 128 and n_block != 128:
+        # - SM100 TMA paged path uses n_block_size=128 (page_size must be a multiple of 128).
+        if page_size >= 128 and page_size % 128 == 0 and n_block != 128:
             continue
         if page_size != 128 and page_size <= 0:
             continue
@@ -594,6 +597,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
+            continue
+        except Exception as e:
+            print(
+                f"SKIP (error): B={batch_size} K={seqlen_k} page={page_size} m={m_block} "
+                f"n={n_block} splits={num_splits} dtype={dtype}: {e}",
+                file=sys.stderr,
+            )
             continue
         rows.append(row)
 

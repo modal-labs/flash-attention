@@ -51,8 +51,23 @@ class PackGQA:
         seqlen: cutlass.Int32,
     ):
         gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        # `sQ` comes from SMEM layouts used by UMMA and is typically not a plain (M, K) view.
+        # Finesse it into a logical (M, K) tensor so that the copy partitioning matches `cQ`.
+        #
+        # For SM100 UMMA A layouts (K-major), sQ is typically shaped as:
+        #   ((M, K/vec), 1, vec)
+        # where vec is the per-instruction vector shape, e.g. (4, 2) for 8 elements.
+        vec_shape = cute.flatten_to_tuple(sQ.shape[2])
+        vec_stride = cute.flatten_to_tuple(sQ.stride[2])
+        sQ_pi = cute.make_tensor(
+            sQ.iterator,
+            cute.make_layout(
+                (sQ.shape[0][0], (sQ.shape[0][1], *vec_shape)),
+                stride=(sQ.stride[0][0], (sQ.stride[0][1], *vec_stride)),
+            ),
+        )
         cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
-        tQsQ = gmem_thr_copy.partition_D(sQ)
+        tQsQ = gmem_thr_copy.partition_D(sQ_pi)
         tQcQ = gmem_thr_copy.partition_S(cQ)
         t0QcQ = gmem_thr_copy.get_slice(0).partition_S(cQ)
         tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[1])

@@ -323,11 +323,6 @@ def _flash_attn_fwd(
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
 
-    if compute_capability in [10, 11]:
-        # TODO: fix GQA + SplitKV + non-varlen
-        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
-            pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
@@ -337,6 +332,17 @@ def _flash_attn_fwd(
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
     else:
         q_stage = 1
+
+    if compute_capability in [10, 11]:
+        use_tma_paged_kv = (
+            page_table is not None
+            and page_size is not None
+            and n_block_size == 128
+            and page_size % 128 == 0
+        )
+    else:
+        use_tma_paged_kv = page_table is not None and page_size == 128
+    paged_kv_non_tma = page_table is not None and not use_tma_paged_kv
 
     if num_splits < 1:
         m_block_size_effective = q_stage * m_block_size
@@ -411,6 +417,7 @@ def _flash_attn_fwd(
         seqused_q is None,
         seqused_k is None,
         page_table is not None,
+        0 if page_size is None else page_size,
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
@@ -424,7 +431,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
-        page_size not in [None, 128],  # paged KV non-TMA
+        paged_kv_non_tma,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -533,7 +540,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=paged_kv_non_tma,
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
             )

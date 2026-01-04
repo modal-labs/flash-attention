@@ -7,7 +7,7 @@
 # - sliding window
 # - split-kv
 # Unsupported features that will be added later:
-# - page size != 128
+# - optimized TMA paged-KV path for page_size not a multiple of 128 (non-TMA fallback exists but is slower)
 # - more hdim (192, 256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
@@ -292,10 +292,17 @@ class FlashAttentionForwardSm100:
             *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
             t.stride[-1],
         )
-        mQ, mK, mV, mO = [
+        mQ, mK, mV = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
+            for t in (mQ, mK, mV)
         ]
+        # For SplitKV, mO is a temporary accumulation buffer (float32) and some stride assumptions
+        # can trip up the PackGQA remapping on SM100. Keep mO's original strides in that case.
+        mO = (
+            mO
+            if const_expr(self.pack_gqa and self.is_split_kv)
+            else cute.make_tensor(mO.iterator, cute.make_layout(mO.shape, stride=new_stride(mO)))
+        )
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -312,12 +319,34 @@ class FlashAttentionForwardSm100:
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             num_splits = Int32(1)
-        mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
-        mLSE = (
-            cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
-            if const_expr(mLSE is not None)
-            else None
-        )
+        # For PackGQA + SplitKV (SM100), use an explicit stride-based transpose for O/LSE to avoid
+        # issues with ScaledBasis strides when we later remap heads.
+        if const_expr(self.pack_gqa and self.is_split_kv and mCuSeqlensQ is None):
+            mO = cute.make_tensor(
+                mO.iterator,
+                cute.make_layout(
+                    (mO.shape[2], mO.shape[4], mO.shape[3], mO.shape[1], mO.shape[0]),
+                    stride=(mO.stride[2], mO.stride[4], mO.stride[3], mO.stride[1], mO.stride[0]),
+                ),
+            )
+            mLSE = (
+                cute.make_tensor(
+                    mLSE.iterator,
+                    cute.make_layout(
+                        (mLSE.shape[3], mLSE.shape[2], mLSE.shape[1], mLSE.shape[0]),
+                        stride=(mLSE.stride[3], mLSE.stride[2], mLSE.stride[1], mLSE.stride[0]),
+                    ),
+                )
+                if const_expr(mLSE is not None)
+                else None
+            )
+        else:
+            mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+            mLSE = (
+                cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+                if const_expr(mLSE is not None)
+                else None
+            )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -340,7 +369,14 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        # PackGQA + SplitKV uses a float32 partial output buffer with a dynamic num_splits dim; disable
+        # TMA store for O in that case (use the universal gmem store path instead).
+        self.use_tma_O = (
+            self.arch >= 90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and not (self.pack_gqa and self.is_split_kv)
+        )
         # This can be tuned
         self.e2e_freq = 16
         if const_expr(
@@ -458,12 +494,27 @@ class FlashAttentionForwardSm100:
                 mK.shape[2],
                 *mO.shape[3:],
             )
-            stride_O_packed = (
-                (mO.stride[2], mO.stride[0]),
-                mO.stride[1],
-                mO.stride[2] * self.qhead_per_kvhead,
-                *mO.stride[3:],
-            )
+            if const_expr(self.is_split_kv):
+                # `mO` is a contiguous float32 accumulation buffer (out_partial) with dynamic
+                # num_splits. Build the packed strides from shapes to avoid ScaledBasis issues.
+                o_stride_head = mO.shape[1]  # dv
+                o_stride_seqlen = mO.shape[2] * o_stride_head
+                o_stride_batch = mO.shape[0] * o_stride_seqlen
+                o_stride_split = mO.shape[3] * o_stride_batch
+                stride_O_packed = (
+                    (o_stride_head, o_stride_seqlen),
+                    1,
+                    o_stride_head * self.qhead_per_kvhead,
+                    o_stride_batch,
+                    o_stride_split,
+                )
+            else:
+                stride_O_packed = (
+                    (mO.stride[2], mO.stride[0]),
+                    mO.stride[1],
+                    mO.stride[2] * self.qhead_per_kvhead,
+                    *mO.stride[3:],
+                )
             mO = cute.make_tensor(
                 mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
             )
@@ -822,9 +873,14 @@ class FlashAttentionForwardSm100:
         if warp_idx == 1:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
             for i in cutlass.range_constexpr(self.q_stage):
-                cute.arch.mbarrier_init(
-                    mbar_ptr + self.mbar_load_q_full_offset + i, 1
+                # TMA Q loads are signaled by a single elected thread, while cp.async Q loads (PackGQA
+                # when M-block isn't divisible by qhead_per_kvhead) are signaled by all load threads.
+                q_full_producers = (
+                    1
+                    if const_expr(self.use_tma_Q)
+                    else cute.arch.WARP_SIZE * len(self.load_warp_ids)
                 )
+                cute.arch.mbarrier_init(mbar_ptr + self.mbar_load_q_full_offset + i, q_full_producers)
                 cute.arch.mbarrier_init(
                     mbar_ptr + self.mbar_load_q_empty_offset + i, len([self.mma_warp_id])
                 )
@@ -1308,34 +1364,41 @@ class FlashAttentionForwardSm100:
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                         load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
-                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
-                    page_idx = (
-                        mPageTable[batch_idx, n_block_first]
+                    blocks_per_page_divmod = (
+                        FastDivmodDivisor(mK.shape[0] // self.n_block_size)
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )
+                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
+                    if const_expr(mPageTable is not None and self.use_tma_KV):
+                        page_block, block_in_page = divmod(n_block_first, blocks_per_page_divmod)
+                        page_idx = mPageTable[batch_idx, page_block]
+                    else:
+                        page_idx = None
+                        block_in_page = n_block_first
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
-                    load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                    load_K(block=block_in_page, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
                         load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
                     q_producer_phase ^= 1
-                    load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                    load_V(block=block_in_page, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
-                        page_idx = (
-                            mPageTable[batch_idx, n_block]
-                            if const_expr(mPageTable is not None and self.use_tma_KV)
-                            else None
-                        )
+                        if const_expr(mPageTable is not None and self.use_tma_KV):
+                            page_block, block_in_page = divmod(n_block, blocks_per_page_divmod)
+                            page_idx = mPageTable[batch_idx, page_block]
+                        else:
+                            page_idx = None
+                            block_in_page = n_block
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
-                        load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                        load_K(block=block_in_page, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                         kv_producer_state.advance()
-                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                        load_V(block=block_in_page, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                         kv_producer_state.advance()
 
             else:
@@ -2738,8 +2801,8 @@ class FlashAttentionForwardSm100:
             if const_expr(self.uneven_kv_smem):
                 # Since this is the producer_state, the phase starts at 1, so we have to invert it
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
-            # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
-            tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
+            # If page_idx is provided (paged KV), `block` is interpreted as block-within-page.
+            tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, block, page_idx]
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
         else:
             assert paged_kv_manager is not None
