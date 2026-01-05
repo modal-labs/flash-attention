@@ -10,6 +10,8 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 
+import math
+
 
 @dataclass
 class PagedKVManager(ParamsBase):
@@ -55,8 +57,8 @@ class PagedKVManager(ParamsBase):
         dtype: Type[cutlass.Numeric],
     ):
         universal_copy_bits = 128
-        gmem_threads_per_row = 8  # 8 threads loading 128 bits = 128 bytes = 1 cache line
         async_copy_elems = universal_copy_bits // dtype.width
+        gmem_threads_per_row = math.gcd(head_dim_padded, head_dim_v_padded) // async_copy_elems
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
@@ -168,10 +170,13 @@ class PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
 
-        seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size if n_block >= 0 else 0
+        seqlenk_row_limit = (
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
+        )
         for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):
-            should_load = tXcX[0, m, 0][0] < seqlenk_row_limit
+            should_load = tXc0X[0, m, 0][0] < seqlenk_row_limit
 
             x_ptr_i64 = utils.shuffle_sync(
                 tPrXPtr[m // self.gmem_threads_per_row],
