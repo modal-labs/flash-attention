@@ -2,7 +2,7 @@
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 
 # Supported features:
-# - BF16 & FP16 dtype
+# - BF16 & FP16 & FP8 (E4M3, E5M2) dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128.
@@ -16,7 +16,6 @@
 # - tuned block sizes
 # - paged KV
 # - append KV to existing KV cache
-# - FP8
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
@@ -48,6 +47,7 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_tensors,
     get_block_sparse_expected_shapes,
     get_block_sparse_expected_shapes_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 @lru_cache(maxsize=None)
@@ -70,6 +70,8 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
 }
 
 
@@ -116,6 +118,9 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -130,6 +135,7 @@ def _flash_attn_fwd(
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
+    q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -175,7 +181,9 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
+    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
+        "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
+    )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -195,6 +203,9 @@ def _flash_attn_fwd(
             q,
             k,
             v,
+            q_descale,
+            k_descale,
+            v_descale,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -216,7 +227,10 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    out_torch_dtype = q.dtype
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
+        raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
+    out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -238,6 +252,15 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
+    if is_fp8:
+        for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
+            if t is not None:
+                _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
+    else:
+        assert q_descale is None and k_descale is None and v_descale is None, (
+            "q_descale/k_descale/v_descale are only supported for FP8 inputs"
+        )
+
     dtype = torch2cute_dtype_map[q.dtype]
     compute_capability = (
         _get_device_capability()
@@ -246,6 +269,8 @@ def _flash_attn_fwd(
     )
 
     assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    if is_fp8:
+        assert compute_capability in [10, 11], "FP8 is only supported on SM100 and SM110 (compute capability 10.x and 11.x) for FA4 CuTe."
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -267,16 +292,6 @@ def _flash_attn_fwd(
     if compute_capability == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
-
-    if compute_capability in [10, 11]:
-        if (
-            pack_gqa
-            and (128 % qhead_per_kvhead != 0)
-        ):
-            pack_gqa = False
-        # TODO: fix GQA + SplitKV + non-varlen
-        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
-            pack_gqa = False
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -340,6 +355,25 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    # See get_broadcast_dims for why this is needed in compile key
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, q_stage,
+        )
+        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors
+        )
+
     compile_key = (
         dtype,
         head_dim,
@@ -349,6 +383,7 @@ def _flash_attn_fwd(
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
+        block_sparse_broadcast_pattern,
         len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
@@ -359,6 +394,9 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
+        q_descale is not None,
+        k_descale is not None,
+        v_descale is not None,
         m_block_size,
         n_block_size,
         q_stage,
@@ -396,20 +434,25 @@ def _flash_attn_fwd(
         else:
             lse_tensor = None
 
+        q_descale_tensor = (
+            to_cute_tensor(q_descale, assumed_align=4, leading_dim=1)
+            if q_descale is not None
+            else None
+        )
+        k_descale_tensor = (
+            to_cute_tensor(k_descale, assumed_align=4, leading_dim=1)
+            if k_descale is not None
+            else None
+        )
+        v_descale_tensor = (
+            to_cute_tensor(v_descale, assumed_align=4, leading_dim=1)
+            if v_descale is not None
+            else None
+        )
+
         sparse_tensors = None
-        if block_sparse_tensors is not None:
-            if seqlen_q is None:
-                raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-            expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
-                batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, q_stage,
-            )
-            compile_time_normalized = normalize_block_sparse_tensors(
-                block_sparse_tensors,
-                expected_count_shape=expected_count_shape,
-                expected_index_shape=expected_index_shape,
-            )
-            sparse_tensors = to_cute_block_sparse_tensors(compile_time_normalized)
+        if normalized_block_sparse_tensors is not None:
+            sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
         if aux_tensors is not None:
@@ -468,7 +511,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -485,27 +528,26 @@ def _flash_attn_fwd(
             window_size_left,
             window_size_right,
             learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
+        ]
+        if compute_capability == 10:
+            compile_args.extend([q_descale_tensor, k_descale_tensor, v_descale_tensor])
+        compile_args.extend([sparse_tensors, cute_aux_tensors])
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args,
             options="--enable-tvm-ffi",
         )
 
-    # Expand block sparse tensors to match actual head count (may be broadcast from 1)
-    normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
-        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
-            batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, q_stage,
-        )
-        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=expected_count_shape,
-            expected_index_shape=expected_index_shape,
-        )
-    _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
+    q_call, k_call, v_call = q, k, v
+    if is_fp8:
+        # Keep runtime argument dtypes consistent with the DLPack workaround in `to_cute_tensor(...)`.
+        q_call = q.view(torch.uint8)
+        k_call = k.view(torch.uint8)
+        v_call = v.view(torch.uint8)
+
+    call_args = [
+        q_call,
+        k_call,
+        v_call,
         out if not is_split_kv else out_partial,
         lse_partial if is_split_kv else lse,
         softmax_scale,
@@ -518,9 +560,11 @@ def _flash_attn_fwd(
         window_size_left,
         window_size_right,
         learnable_sink,
-        normalized_block_sparse_tensors,
-        aux_tensors,
-    )
+    ]
+    if compute_capability == 10:
+        call_args.extend([q_descale, k_descale, v_descale])
+    call_args.extend([normalized_block_sparse_tensors, aux_tensors])
+    _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -880,6 +924,28 @@ def _flash_attn_bwd(
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors = None
+    if block_sparse_tensors is not None:
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, subtile_factor,
+        )
+        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+            context="_flash_attn_bwd",
+            hint=lambda: (
+                f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
+                f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
+                f"(sparse_block_size_q={sparse_block_size_q})."
+            ),
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors
+        )
+
     if compute_capability == 9:
         compile_key = (
             compute_capability,
@@ -911,6 +977,7 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
         )
     else:
         compile_key = (
@@ -934,10 +1001,11 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
-            seqused_k is None,  
+            seqused_k is None,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1027,23 +1095,8 @@ def _flash_attn_bwd(
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         # sparse_block_size_q = subtile_factor * tile_m matches BlockMask granularity.
         sparse_tensors_compile = None
-        if block_sparse_tensors is not None:
-            expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
-                batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, subtile_factor,
-            )
-            compile_time_normalized = normalize_block_sparse_tensors(
-                block_sparse_tensors,
-                expected_count_shape=expected_count_shape,
-                expected_index_shape=expected_index_shape,
-                context="_flash_attn_bwd",
-                hint=lambda: (
-                    f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
-                    f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
-                    f"(sparse_block_size_q={sparse_block_size_q})."
-                ),
-            )
-            sparse_tensors_compile = to_cute_block_sparse_tensors(compile_time_normalized)
+        if normalized_block_sparse_tensors is not None:
+            sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1073,25 +1126,6 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             options="--enable-tvm-ffi",
         )
-    # Runtime normalization of block sparse tensors for both SM90 and SM100
-    normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
-        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
-            batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, subtile_factor,
-        )
-        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=expected_count_shape,
-            expected_index_shape=expected_index_shape,
-            context="_flash_attn_bwd",
-            hint=lambda: (
-                f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
-                f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
-                f"(sparse_block_size_q={sparse_block_size_q})."
-            ),
-        )
-
     _flash_attn_bwd.compile_cache[compile_key](
         q,
         k,
