@@ -21,6 +21,7 @@ class PagedKVManager(ParamsBase):
     thread_idx: Int32
 
     page_size_divmod: FastDivmodDivisor
+    page_table_affine: cutlass.Constexpr[bool]
     seqlen_k: Int32
     leftpad_k: Int32
     n_block_size: Int32
@@ -45,6 +46,7 @@ class PagedKVManager(ParamsBase):
         mK_paged: cute.Tensor,
         mV_paged: cute.Tensor,
         page_size_divmod: FastDivmodDivisor,
+        page_table_affine: cutlass.Constexpr[bool],
         bidb: Int32,
         bidh: Int32,
         thread_idx: Int32,
@@ -105,6 +107,7 @@ class PagedKVManager(ParamsBase):
             mV_paged,
             thread_idx,
             page_size_divmod,
+            page_table_affine,
             seqlen_k,
             leftpad_k,
             n_block_size,
@@ -124,6 +127,9 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def load_page_table(self, n_block: Int32):
+        base_page = Int32(0)
+        if const_expr(self.page_table_affine):
+            base_page = self.mPageTable[0]
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
             row = (
                 i * self.num_threads
@@ -132,13 +138,21 @@ class PagedKVManager(ParamsBase):
                 + (self.thread_idx // self.gmem_threads_per_row)
             )
             row_idx = n_block * self.n_block_size + row
+            row_idx_with_pad = row_idx + self.leftpad_k
 
-            page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
+            if const_expr(self.page_table_affine):
+                page_idx = row_idx_with_pad
+                page_offset = Int32(0)
+            else:
+                page_idx, page_offset = divmod(row_idx_with_pad, self.page_size_divmod)
 
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
             ) and row_idx < self.seqlen_k
-            page = self.mPageTable[page_idx] if is_valid else 0
+            if const_expr(self.page_table_affine):
+                page = base_page + page_idx if is_valid else 0
+            else:
+                page = self.mPageTable[page_idx] if is_valid else 0
 
             self.tPrPage[i] = page
             self.tPrPageOffset[i] = page_offset

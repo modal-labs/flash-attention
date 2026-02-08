@@ -102,6 +102,7 @@ def _flash_attn_fwd(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
+    page_table_affine: bool = False,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: Optional[float] = None,
@@ -154,7 +155,10 @@ def _flash_attn_fwd(
         assert page_table.shape == (batch_size, max_num_pages_per_seq)
         num_pages, page_size = k.shape[:2]
         seqlen_k = num_pages * page_size
+        if page_table_affine:
+            assert page_size == 1, "page_table_affine currently supports only page_size == 1"
     else:
+        assert not page_table_affine, "page_table_affine requires page_table"
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
@@ -397,6 +401,7 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
+        page_table_affine,
         q_subtile_factor,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -481,6 +486,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_page1_affine=page_table_affine and page_size == 1,
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
@@ -1342,6 +1348,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         page_table: Optional[torch.Tensor] = None,
+        page_table_affine: bool = False,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -1364,6 +1371,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             page_table=page_table,
+            page_table_affine=page_table_affine,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size_left=window_size[0],
@@ -1464,6 +1472,7 @@ def flash_attn_varlen_func(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
+    page_table_affine: bool = False,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -1486,6 +1495,7 @@ def flash_attn_varlen_func(
         max_seqlen_q,
         max_seqlen_k,
         page_table,
+        page_table_affine,
         softmax_scale,
         causal,
         window_size,

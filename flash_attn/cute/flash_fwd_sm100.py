@@ -88,9 +88,11 @@ class FlashAttentionForwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
+        paged_kv_page1_affine: bool = False,
         is_varlen_q: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        self.paged_kv_page1_affine = paged_kv_page1_affine
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -1208,6 +1210,7 @@ class FlashAttentionForwardSm100:
                     mK,
                     mV,
                     FastDivmodDivisor(page_size),
+                    self.paged_kv_page1_affine,
                     batch_idx,
                     head_idx_kv,
                     tidx,
